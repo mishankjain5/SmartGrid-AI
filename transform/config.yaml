@@ -1,0 +1,30 @@
+# SQLMesh project configuration.
+#
+# Requires GCP_PROJECT in the environment:
+#   $env:GCP_PROJECT = "smartgrid-ai-504119"
+#
+# Then:
+#   cd transform
+#   sqlmesh plan --auto-apply
+#   sqlmesh audit
+
+gateways:
+  bigquery:
+    connection:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('GCP_PROJECT') }}"
+      location: "{{ env_var('GCP_LOCATION', 'EU') }}"
+
+    # SQLMesh's own bookkeeping — snapshots, versions, environments — kept in a
+    # local file rather than BigQuery, which has no cross-statement transactions
+    # and charges per query. This is metadata only; no project data touches it.
+    state_connection:
+      type: duckdb
+      database: ../data/sqlmesh_state.duckdb
+
+default_gateway: bigquery
+
+model_defaults:
+  dialect: bigquery
+  start: 2022-01-01

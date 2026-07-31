@@ -2,6 +2,7 @@
 
 import os
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,6 +20,17 @@ MARKET_TIMEZONE = "Europe/Berlin"
 # hours of the following day.
 GATE_HOUR = 12
 LEAD_DAYS = 1
+
+# Bounded by the Open-Meteo forecast archive, which begins 2022-01-01. Grid data
+# reaches further back but cannot be paired with a weather forecast before this.
+DATA_START = date(2022, 1, 1)
+
+BIGQUERY_RAW_DATASET = "raw"
+
+
+def data_end() -> date:
+    """Last complete day across all sources."""
+    return date.today() - timedelta(days=1)
 
 load_dotenv(PROJECT_ROOT / ".env")
 

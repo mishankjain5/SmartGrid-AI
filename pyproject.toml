@@ -35,6 +35,10 @@ packages = ["src/smartgrid"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "network: hits a live external API; deselect with -m 'not network'",
+    "cloud: requires BigQuery credentials",
+]
 
 [tool.ruff]
 line-length = 100

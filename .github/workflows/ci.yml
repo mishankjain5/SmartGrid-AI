@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      # No GCP credentials and no network here, so cloud- and network-marked
+      # tests skip themselves. What remains still covers the logic that matters:
+      # gate arithmetic, feature construction, the dispatch optimiser and the
+      # scoring rules.
+      - name: Test
+        run: pytest -q -m "not network"
+
+  notebook:
+    # The notebook queries BigQuery, so it cannot execute here. This checks it is
+    # valid JSON with outputs intact — enough to catch a corrupted or
+    # never-executed commit.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check the notebook is executed and well formed
+        run: |
+          pip install nbformat
+          python - <<'PY'
+          import sys
+
+          import nbformat
+
+          nb = nbformat.read("notebooks/01_exploratory_analysis.ipynb", as_version=4)
+          code = [c for c in nb.cells if c.cell_type == "code"]
+          errors = [o for c in code for o in c.outputs if o.output_type == "error"]
+          without_output = [i for i, c in enumerate(code) if not c.outputs]
+
+          print(f"{len(nb.cells)} cells, {len(code)} code")
+          if errors:
+              print(f"FAIL: {len(errors)} cells errored when executed")
+              sys.exit(1)
+          if without_output:
+              print(f"FAIL: cells {without_output} have no output; commit it executed")
+              sys.exit(1)
+          print("notebook is executed and error-free")
+          PY

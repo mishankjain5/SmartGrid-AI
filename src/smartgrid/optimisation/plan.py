@@ -20,9 +20,9 @@ import pandas as pd
 from smartgrid.config import MARKET_TIMEZONE
 from smartgrid.optimisation.battery import Battery, optimise_day
 
-#: A household's baseline draw, in MW. Stands in for a consumption forecast,
-#: which this project does not build; stated explicitly so the assumption is
-#: visible in the output rather than buried.
+#: Fallback draw in MW, used only when no measured load profile is supplied.
+#: Roughly 9.6 kWh a day — about half what the metered household in the OPSD
+#: panel actually uses, which is why a profile is preferred.
 TYPICAL_HOUSEHOLD_LOAD_MW = 0.0004
 
 
@@ -93,6 +93,7 @@ def plan_day(
     *,
     battery: Battery | None = None,
     system_kwp: float = 10.0,
+    load_kwh: pd.Series | None = None,
     household_load_mw: float = TYPICAL_HOUSEHOLD_LOAD_MW,
 ) -> DayPlan:
     """Build tomorrow's recommendation.
@@ -105,7 +106,10 @@ def plan_day(
             applied to it, which assumes their roof behaves like the national
             fleet — reasonable for a rough figure, wrong in detail for any one
             roof's orientation and shading.
-        household_load_mw: baseline consumption, used to value self-consumed solar.
+        load_kwh: forecast consumption per hour, indexed by UTC timestamp. From
+            `household.LoadProfile.for_day`. Falls back to a flat draw when
+            absent, which understates a real home's usage by roughly half.
+        household_load_mw: the flat fallback, used only when `load_kwh` is None.
     """
     battery = battery or Battery()
 
@@ -122,7 +126,17 @@ def plan_day(
 
     # The customer's array, scaled from the national capacity factor.
     solar_mw = frame["predicted_capacity_factor"].to_numpy() * (system_kwp / 1000)
-    self_consumed_mw = np.minimum(solar_mw, household_load_mw)
+
+    if load_kwh is not None:
+        # kWh in an hour is kW, and MW is a thousandth of that.
+        load_mw = load_kwh.reindex(frame.index).to_numpy() / 1000
+        load_mw = np.where(np.isnan(load_mw), household_load_mw, load_mw)
+    else:
+        load_mw = np.full(len(frame), household_load_mw)
+
+    # Solar covers demand first; only the surplus is exported. Self-consumption
+    # is worth the price that would otherwise have been paid for it.
+    self_consumed_mw = np.minimum(solar_mw, load_mw)
     solar_value = float(np.dot(frame["price_eur_mwh"].to_numpy(), self_consumed_mw))
 
     local = frame.index.tz_convert(MARKET_TIMEZONE)
@@ -137,6 +151,7 @@ def plan_day(
             "local_hour": local.hour,
             "price_eur_mwh": frame["price_eur_mwh"].to_numpy(),
             "predicted_solar_kw": clean(solar_mw * 1000),
+            "expected_load_kw": clean(load_mw * 1000),
             "charge_kw": clean(schedule.charge_mw * 1000),
             "discharge_kw": clean(schedule.discharge_mw * 1000),
             "state_of_charge_kwh": clean(schedule.state_of_charge_mwh * 1000),

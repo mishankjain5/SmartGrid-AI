@@ -13,6 +13,7 @@ import argparse
 import pandas as pd
 
 from smartgrid.config import MARKET_TIMEZONE
+from smartgrid.modelling.household import fit_profile
 from smartgrid.modelling.predict import predict_day, target_day
 from smartgrid.modelling.store import save_predictions
 from smartgrid.optimisation.battery import Battery
@@ -72,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    profile = fit_profile()
     plan = plan_day(
         prediction,
         prices,
@@ -81,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
             round_trip_efficiency=args.round_trip,
         ),
         system_kwp=args.system_kwp,
+        load_kwh=profile.for_day(day),
     )
 
     print(
@@ -94,7 +97,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  - {line}")
 
     total_solar = plan.hours["predicted_solar_kw"].sum()
+    total_load = plan.hours["expected_load_kw"].sum()
     print(f"\nPredicted generation: {total_solar:.1f} kWh over the day.")
+    print(
+        f"Expected consumption: {total_load:.1f} kWh "
+        f"(profile from {profile.building}, {profile.hours_observed:,} metered hours)."
+    )
     return 0
 
 

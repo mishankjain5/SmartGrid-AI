@@ -66,12 +66,18 @@ def test_unknown_table_is_rejected(captured_loads, stub_sources):
         ingest.ingest(["not_a_table"])
 
 
-def test_default_window_starts_at_the_archive_boundary(captured_loads, stub_sources):
+def test_default_window_runs_to_today(captured_loads, stub_sources):
+    """Not yesterday.
+
+    A day-ahead forecast needs generation within 48 hours of the target day, and
+    stopping at yesterday leaves the shortest lag short. Sources return what
+    exists, so the final day is simply partial.
+    """
     ingest.ingest(["price"])
     _, start, end, _ = stub_sources[0]
 
     assert start == DATA_START
-    assert end < date.today(), "end is the last complete day, not today"
+    assert end == date.today()
 
 
 def test_explicit_window_is_passed_through(captured_loads, stub_sources):

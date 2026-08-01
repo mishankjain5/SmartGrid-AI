@@ -26,3 +26,6 @@ SELECT
   COUNTIF(production_type = 'solar') AS source_intervals
 FROM raw.day_ahead_forecast
 GROUP BY 1
+-- Ingestion runs to the current day, so the final hour is often incomplete.
+-- Dropped until all its intervals exist; see stg_price for the reasoning.
+HAVING COUNTIF(production_type = 'solar') IN (1, 4)

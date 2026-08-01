@@ -5,5 +5,14 @@ from smartgrid.optimisation.battery import (
     optimise_day,
     optimise_series,
 )
+from smartgrid.optimisation.plan import DayPlan, plan_day
 
-__all__ = ["Battery", "Schedule", "annualise", "optimise_day", "optimise_series"]
+__all__ = [
+    "Battery",
+    "DayPlan",
+    "Schedule",
+    "annualise",
+    "optimise_day",
+    "optimise_series",
+    "plan_day",
+]

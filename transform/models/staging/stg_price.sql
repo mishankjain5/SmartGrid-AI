@@ -29,3 +29,8 @@ SELECT
 FROM raw.price
 WHERE price_eur_mwh IS NOT NULL
 GROUP BY 1
+-- Ingestion runs to the current day, so the final hour is often mid-flight with
+-- only some of its intervals published. Averaging those would understate or
+-- overstate the hour, so it is dropped until complete. The audit still guards
+-- the rule: without this filter, a partial hour would fail the build.
+HAVING COUNT(*) IN (1, 4)

@@ -15,6 +15,11 @@ from smartgrid.modelling.models import (
     Persistence,
     default_models,
 )
+from smartgrid.modelling.predict import (
+    build_prediction_features,
+    predict_day,
+    target_day,
+)
 
 __all__ = [
     "BENCHMARK",
@@ -27,9 +32,12 @@ __all__ = [
     "GradientBoosting",
     "LinearIrradiance",
     "Persistence",
+    "build_prediction_features",
     "default_models",
     "is_daylight",
     "load_features",
     "modelling_frame",
+    "predict_day",
     "run_backtest",
+    "target_day",
 ]

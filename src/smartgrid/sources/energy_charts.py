@@ -15,7 +15,7 @@ the transformation layer.
 """
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -38,18 +38,24 @@ def _cache_path(name: str) -> Path:
     return CACHE_DIR / f"{name}.json"
 
 
+#: Passed as `cache_name` by callers that must never read or write the cache,
+#: such as anything fetching prices for hours still in the future.
+NO_CACHE = "__uncached__"
+
+
 def _request(path: str, cache_name: str, refresh: bool = False, **params) -> dict:
     """GET an endpoint, caching the JSON body under `cache_name`."""
     cached = _cache_path(cache_name)
-    if cached.exists() and not refresh:
+    if cache_name != NO_CACHE and cached.exists() and not refresh:
         return json.loads(cached.read_text(encoding="utf-8"))
 
     response = requests.get(f"{BASE_URL}{path}", params=params, timeout=TIMEOUT_SECONDS)
     response.raise_for_status()
     payload = response.json()
 
-    cached.parent.mkdir(parents=True, exist_ok=True)
-    cached.write_text(json.dumps(payload), encoding="utf-8")
+    if cache_name != NO_CACHE:
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        cached.write_text(json.dumps(payload), encoding="utf-8")
     return payload
 
 
@@ -78,6 +84,34 @@ def fetch_price(
             "price_eur_mwh": pd.to_numeric(payload["price"], errors="coerce"),
         }
     )
+
+
+def fetch_upcoming_price(*, days_ahead: int = 2) -> pd.DataFrame:
+    """Day-ahead prices including tomorrow, once the auction has cleared.
+
+    Tomorrow's prices are *published*, not predicted: the auction closes at 12:00
+    and results appear around 12:45 market time. Before that the response covers
+    today only, which is why callers check how far the series actually reaches
+    rather than assuming tomorrow is present.
+
+    Never cached — the point is the newest publication.
+    """
+    today = date.today()
+    payload = _request(
+        "/price",
+        cache_name=NO_CACHE,
+        refresh=True,
+        bzn=BIDDING_ZONE,
+        start=str(today - timedelta(days=1)),
+        end=str(today + timedelta(days=days_ahead)),
+    )
+
+    return pd.DataFrame(
+        {
+            "utc_timestamp": _timestamps(payload),
+            "price_eur_mwh": pd.to_numeric(payload["price"], errors="coerce"),
+        }
+    ).dropna(subset=["price_eur_mwh"])
 
 
 def fetch_public_power(

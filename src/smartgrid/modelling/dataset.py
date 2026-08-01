@@ -15,6 +15,16 @@ import pandas as pd
 from smartgrid.config import get_settings
 from smartgrid.warehouse import query
 
+__all__ = [
+    "BENCHMARK",
+    "FEATURES",
+    "TARGET",
+    "is_daylight",
+    "load_features",
+    "load_recent_generation",
+    "modelling_frame",
+]
+
 TARGET = "solar_capacity_factor"
 
 #: Irradiance at each of the nine sampled locations. Worth about 4% of accuracy
@@ -103,6 +113,33 @@ def load_features() -> pd.DataFrame:
     )
     frame["local_datetime"] = pd.to_datetime(frame["local_datetime"])
     return frame
+
+
+def load_recent_generation(days: int = 30) -> pd.DataFrame:
+    """Observed capacity factor straight from staging, bypassing the mart.
+
+    The lag features need generation history, not weather. Reading them from the
+    feature mart would couple them to weather coverage, because the mart inner
+    joins the two — so a weather table a day behind would block a forecast whose
+    inputs are all present. This reads generation and capacity directly.
+    """
+    project = get_settings().require_project()
+
+    return query(
+        f"""
+        SELECT
+          g.utc_timestamp,
+          SAFE_DIVIDE(g.solar_mw, c.solar_ac_mw) AS {TARGET},
+          c.solar_ac_mw
+        FROM `{project}.staging.stg_generation` AS g
+        LEFT JOIN `{project}.staging.stg_capacity` AS c
+          ON DATE_TRUNC(DATE(g.utc_timestamp), MONTH) = DATE(c.month)
+        WHERE g.utc_timestamp >= TIMESTAMP_SUB(
+                CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+          AND g.solar_mw IS NOT NULL
+        ORDER BY g.utc_timestamp
+        """
+    )
 
 
 def modelling_frame(frame: pd.DataFrame) -> pd.DataFrame:

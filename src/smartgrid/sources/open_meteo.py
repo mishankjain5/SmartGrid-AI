@@ -40,6 +40,11 @@ import requests
 from smartgrid.config import RAW_DATA_DIR
 
 BASE_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+
+#: Forward forecasts, for hours that have not happened yet. The historical
+#: archive covers only the past, so predicting tomorrow needs this endpoint.
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
 CACHE_DIR = RAW_DATA_DIR / "open_meteo"
 
 # One location over the full window takes around three minutes to generate.
@@ -153,6 +158,76 @@ def _fetch_location(
         end_date=str(end),
         hourly=",".join(ALL_VARIABLES),
         timezone="UTC",
+    )
+
+
+def fetch_forecast(
+    *,
+    days: int = 3,
+    past_days: int = 1,
+    locations: dict[str, tuple[float, float]] | None = None,
+) -> pd.DataFrame:
+    """Weather for hours that have not happened yet, in long form.
+
+    Uses the forward forecast endpoint rather than the archive. Never cached:
+    the whole point is the newest available run, and a stale file would silently
+    produce a forecast from yesterday's weather.
+
+    Only one lead time exists here — the current forecast — so columns are the
+    plain names. The `_day_ahead` distinction applies to the archive, where two
+    leads are available for the same past hour.
+
+    `past_days` extends the response backwards. A German market day begins at
+    22:00 or 23:00 UTC on the previous calendar day, so a response starting at
+    UTC midnight leaves the target day's first hours uncovered.
+    """
+    locations = locations or LOCATIONS
+    names = list(locations)
+
+    def fetch(name: str) -> dict:
+        latitude, longitude = locations[name]
+        response = requests.get(
+            FORECAST_URL,
+            params={
+                "latitude": latitude,
+                "longitude": longitude,
+                "hourly": ",".join(VARIABLES),
+                "forecast_days": days,
+                "past_days": past_days,
+                "timezone": "UTC",
+            },
+            timeout=TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as pool:
+        payload = list(pool.map(fetch, names))
+
+    frames = []
+    for name, location in zip(names, payload, strict=True):
+        hourly = location["hourly"]
+        missing = [v for v in VARIABLES if v not in hourly]
+        if missing:
+            raise KeyError(f"forecast for {name} is missing variables: {missing}")
+
+        frames.append(
+            pd.DataFrame(
+                {
+                    "utc_timestamp": pd.to_datetime(hourly["time"], utc=True),
+                    "location": name,
+                    "latitude": location["latitude"],
+                    "longitude": location["longitude"],
+                }
+                | {
+                    column: pd.to_numeric(hourly[api_name], errors="coerce")
+                    for api_name, column in VARIABLES.items()
+                }
+            )
+        )
+
+    return pd.concat(frames, ignore_index=True).sort_values(
+        ["location", "utc_timestamp"], ignore_index=True
     )
 
 

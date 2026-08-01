@@ -2,7 +2,7 @@
 
 import os
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -36,8 +36,14 @@ BIGQUERY_RAW_DATASET = "raw"
 
 
 def data_end() -> date:
-    """Last complete day across all sources."""
-    return date.today() - timedelta(days=1)
+    """How far forward to request data.
+
+    Today, not yesterday. A day-ahead forecast needs generation history within 48
+    hours of the target, and stopping at yesterday leaves the shortest lag short
+    by a few hours. Sources return what exists, so requesting today simply yields
+    a partial final day; the staging models drop any incomplete trailing hour.
+    """
+    return date.today()
 
 load_dotenv(PROJECT_ROOT / ".env")
 

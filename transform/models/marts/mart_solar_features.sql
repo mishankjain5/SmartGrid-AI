@@ -46,8 +46,22 @@ WITH hours AS (
   LEFT JOIN staging.stg_day_ahead_forecast AS f USING (utc_timestamp)
 ),
 
+/*
+  Capacity is published monthly and lags: generation for the current month
+  arrives before the capacity figure for it does. An exact month join therefore
+  leaves the newest days with no denominator, which would silently drop exactly
+  the rows a live forecast depends on.
+
+  The last known value is carried forward instead. Installed capacity moves by
+  about 1% a month and only ever upward, so a stale figure understates growth
+  slightly; a missing one loses the day entirely.
+*/
 with_capacity AS (
-  SELECT h.*, c.solar_ac_mw
+  SELECT
+    h.*,
+    LAST_VALUE(c.solar_ac_mw IGNORE NULLS) OVER (
+      ORDER BY h.utc_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS solar_ac_mw
   FROM hours AS h
   LEFT JOIN staging.stg_capacity AS c
     ON DATE_TRUNC(DATE(h.local_datetime), MONTH) = DATE(c.month)

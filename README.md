@@ -4,9 +4,10 @@ Day-ahead forecasting and battery dispatch optimisation for the German
 electricity market.
 
 A household with rooftop PV, a heat pump, an EV and a battery has to decide each
-hour whether to store energy, export it, or buy from the grid. Making that
-decision well needs three forecasts — solar generation, consumption, and price —
-and an optimiser that turns them into a schedule.
+evening what the battery should do tomorrow. Tomorrow's prices are already known
+— the day-ahead auction clears at noon and publishes shortly after — so the
+uncertain input is how much the sun will generate. That is what this forecasts,
+and an optimiser turns it into a charge and discharge schedule.
 
 ## What it does
 
@@ -23,15 +24,21 @@ Cheapest power at 12:00, 13:00, 14:00; dearest at 19:00, 20:00, 21:00.
 Charge from the grid around 12:00, 13:00, 14:00, 23:00.
 Discharge around 00:00, 20:00, 21:00.
 Solar peaks near 12:00 at 4.4 kW.
-Expected benefit on 2026-08-02: EUR 2.09
-  (1.75 from the battery, 0.33 from solar offsetting purchases).
+Expected benefit on 2026-08-02: EUR 2.34
+  (1.75 from the battery, 0.59 from solar offsetting purchases).
+
+Predicted generation: 38.0 kWh over the day.
+Expected consumption: 20.4 kWh (profile from residential4, 20,295 metered hours).
 ```
 
 Prices went **negative** that midday — down to −3.73 EUR/MWh — so the battery
 charges while being paid to consume and discharges into the 186 EUR evening
-peak. Tomorrow's prices are published rather than predicted: the auction clears
-at noon the day before. The uncertain input is solar, which is what the model
-supplies.
+peak.
+
+Across 1,675 days of real prices the same system is worth about **EUR 716 a
+year**: EUR 370 from battery trading and EUR 346 from solar covering the
+household's own use. It ranges from EUR 0.58 a day in January to EUR 1.78 in
+August, so a single summer day is a poor guide to the annual figure.
 
 ## Results
 
@@ -200,20 +207,27 @@ Running daily is ingest → `sqlmesh plan` → `tomorrow --save`, after 13:00 ma
 time so the auction has published. A forecast needs generation history within 48
 hours of the target day, so the ingest is not optional.
 
-## Roadmap
+## Known limitations
 
-- [x] Ingestion from three sources into BigQuery
-- [x] Cleaning and preprocessing in SQLMesh, with audits
-- [x] Feature engineering with gate-time discipline
-- [x] Exploratory analysis
-- [x] Day-ahead solar forecasting, backtested against the operators' forecast
-- [x] Live prediction for the coming day
-- [x] Battery dispatch optimiser and daily recommendation
-- [x] Dashboard
-- [x] Forecast persistence and live scoring
-- [ ] Household consumption forecasting — OPSD data is ingested but not yet
-      modelled; `plan.py` uses a fixed baseline load in its place
-- [ ] Price forecasting — would close the EUR 85/year gap to perfect foresight
+**Self-consumption is valued at wholesale prices.** A German household pays
+roughly EUR 0.30/kWh retail, so avoiding a purchase is worth more to them than
+the wholesale figure used here. That is consistent for the battery, which really
+does trade against wholesale, but understates the household side.
+
+**The consumption profile is calendar-only.** The OPSD household panel ends in
+2018 and the weather archive begins in 2024, so there is no overlap to join on.
+The profile cannot see temperature and will miss a cold snap driving a heat
+pump. It also barely beats a flat assumption hour to hour — a single home's
+demand is dominated by when someone happens to run an appliance — though it does
+get the daily level right, which the previous fixed constant did not.
+
+**Prices are used, not forecast.** Correct for day-ahead planning, since they
+are published before the decision. Perfect price foresight would be worth about
+EUR 85/year more, which is the ceiling a price model would chase.
+
+**Two and a half years of training data.** Open-Meteo archives day-ahead
+radiation forecasts only from 2024-01-19; earlier hours cannot produce an
+honest feature row.
 
 ## Licence
 

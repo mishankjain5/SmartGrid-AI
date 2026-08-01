@@ -37,8 +37,12 @@ def coverage():
 def test_every_hourly_model_covers_a_comparable_span(coverage):
     counts = coverage["n"]
     assert counts.min() > 40_000
-    # Boundary handling differs by source, but not by more than a couple of hours.
-    assert counts.max() - counts.min() <= 2
+
+    # Sources may be refreshed independently, so the newest table can extend a
+    # day or two past the others, and the two APIs disagree about whether date
+    # bounds are local or UTC. Anything beyond that is a truncated load rather
+    # than a boundary difference. Joinability is asserted separately below.
+    assert counts.max() - counts.min() <= 72
 
 
 def test_models_overlap_enough_to_join(coverage):

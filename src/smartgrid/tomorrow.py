@@ -14,6 +14,7 @@ import pandas as pd
 
 from smartgrid.config import MARKET_TIMEZONE
 from smartgrid.modelling.predict import predict_day, target_day
+from smartgrid.modelling.store import save_predictions
 from smartgrid.optimisation.battery import Battery
 from smartgrid.optimisation.plan import plan_day
 from smartgrid.sources import energy_charts
@@ -42,6 +43,11 @@ def main(argv: list[str] | None = None) -> int:
         type=pd.Timestamp,
         help="target a specific day instead of tomorrow, e.g. 2026-08-01",
     )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="persist the forecast so it can be scored once the day has passed",
+    )
     args = parser.parse_args(argv)
 
     day = (
@@ -50,6 +56,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Forecasting {day.date()}\n")
 
     prediction = predict_day(day=day)
+
+    if args.save:
+        rows = save_predictions(prediction, model_name="gradient_boosting")
+        print(f"Saved {len(prediction)} hours; {rows:,} forecast rows stored.\n")
+
     prices = load_published_prices()
 
     covered = prices.loc[prices.index >= day.tz_convert("UTC")]

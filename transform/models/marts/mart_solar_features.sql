@@ -34,37 +34,17 @@ MODEL (
   BENCHMARK. tso_solar_forecast_mw is what the transmission operators published
   for the same hour. Carried as a comparison, never a feature.
 */
-WITH hours AS (
+WITH with_capacity AS (
   SELECT
-    g.utc_timestamp,
-    DATETIME(g.utc_timestamp, 'Europe/Berlin') AS local_datetime,
-    g.solar_mw,
+    s.utc_timestamp,
+    s.local_datetime,
+    s.solar_mw,
+    s.solar_ac_mw,
     w.* EXCEPT (utc_timestamp, locations_reporting),
     f.solar_forecast_mw AS tso_solar_forecast_mw
-  FROM staging.stg_generation AS g
+  FROM staging.stg_solar_output AS s
   INNER JOIN staging.stg_weather_national AS w USING (utc_timestamp)
   LEFT JOIN staging.stg_day_ahead_forecast AS f USING (utc_timestamp)
-),
-
-/*
-  Capacity is published monthly and lags: generation for the current month
-  arrives before the capacity figure for it does. An exact month join therefore
-  leaves the newest days with no denominator, which would silently drop exactly
-  the rows a live forecast depends on.
-
-  The last known value is carried forward instead. Installed capacity moves by
-  about 1% a month and only ever upward, so a stale figure understates growth
-  slightly; a missing one loses the day entirely.
-*/
-with_capacity AS (
-  SELECT
-    h.*,
-    LAST_VALUE(c.solar_ac_mw IGNORE NULLS) OVER (
-      ORDER BY h.utc_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS solar_ac_mw
-  FROM hours AS h
-  LEFT JOIN staging.stg_capacity AS c
-    ON DATE_TRUNC(DATE(h.local_datetime), MONTH) = DATE(c.month)
 ),
 
 /*

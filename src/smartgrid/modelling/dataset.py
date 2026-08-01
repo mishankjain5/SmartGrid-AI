@@ -127,17 +127,12 @@ def load_recent_generation(days: int = 30) -> pd.DataFrame:
 
     return query(
         f"""
-        SELECT
-          g.utc_timestamp,
-          SAFE_DIVIDE(g.solar_mw, c.solar_ac_mw) AS {TARGET},
-          c.solar_ac_mw
-        FROM `{project}.staging.stg_generation` AS g
-        LEFT JOIN `{project}.staging.stg_capacity` AS c
-          ON DATE_TRUNC(DATE(g.utc_timestamp), MONTH) = DATE(c.month)
-        WHERE g.utc_timestamp >= TIMESTAMP_SUB(
+        SELECT utc_timestamp, {TARGET}, solar_ac_mw
+        FROM `{project}.staging.stg_solar_output`
+        WHERE utc_timestamp >= TIMESTAMP_SUB(
                 CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
-          AND g.solar_mw IS NOT NULL
-        ORDER BY g.utc_timestamp
+          AND {TARGET} IS NOT NULL
+        ORDER BY utc_timestamp
         """
     )
 

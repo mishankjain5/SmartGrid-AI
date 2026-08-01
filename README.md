@@ -8,8 +8,30 @@ hour whether to store energy, export it, or buy from the grid. Making that
 decision well needs three forecasts — solar generation, consumption, and price —
 and an optimiser that turns them into a schedule.
 
-> **Status: complete.** Ingestion, cleaning, features, forecasting, dashboard
-> and battery optimiser all built and tested end to end.
+## What it does
+
+```bash
+python -m smartgrid.tomorrow          # forecast tomorrow, recommend a schedule
+python -m smartgrid.tomorrow --save   # and persist it for later scoring
+python -m smartgrid.score             # compare saved forecasts to what happened
+```
+
+A run for 2026-08-02, a 10 kWp array with a 10 kWh battery:
+
+```
+Cheapest power at 12:00, 13:00, 14:00; dearest at 19:00, 20:00, 21:00.
+Charge from the grid around 12:00, 13:00, 14:00, 23:00.
+Discharge around 00:00, 20:00, 21:00.
+Solar peaks near 12:00 at 4.4 kW.
+Expected benefit on 2026-08-02: EUR 2.09
+  (1.75 from the battery, 0.33 from solar offsetting purchases).
+```
+
+Prices went **negative** that midday — down to −3.73 EUR/MWh — so the battery
+charges while being paid to consume and discharges into the 186 EUR evening
+peak. Tomorrow's prices are published rather than predicted: the auction clears
+at noon the day before. The uncertain input is solar, which is what the model
+supplies.
 
 ## Results
 
@@ -37,13 +59,18 @@ from regional detail — removing the per-location columns costs only 4%.
 
 | Strategy | Revenue | Cycles/year |
 |---|---|---|
-| Perfect foresight | EUR 456/yr | 794 |
-| Previous-day prices | EUR 368/yr | 795 |
+| Perfect foresight | EUR 455/yr | 697 |
+| Previous-day prices | EUR 370/yr | 697 |
 
-Perfect foresight is an upper bound, not an achievable result. The EUR 88/year
-gap is what a price forecast would be worth. Note the naive strategy cycles just
-as hard for 19% less — it is trading at the wrong times, not less often.
-Degradation is not modelled, so check the cycle count against a warranty.
+Perfect foresight is an upper bound, not an achievable result. The EUR 85/year
+gap is what a price forecast would be worth. The naive strategy cycles just as
+hard for 19% less — it trades at the wrong times, not less often. Degradation is
+not modelled, so check the cycle count against a warranty.
+
+Dispatch is a mixed-integer program rather than a plain linear one. A pure LP
+charges and discharges in the same hour whenever prices go negative: being paid
+to consume makes it profitable to circulate energy and burn it as round-trip
+losses. A binary per hour forbids it, for identical revenue and 12% fewer cycles.
 
 ## Pipeline
 
@@ -58,6 +85,8 @@ BigQuery: staging → marts
    │  modelling (Python, scikit-learn)
    ▼
 forecasts → dashboard → battery optimiser
+   │
+   └─ saved to BigQuery, scored against measured output
 ```
 
 SQL handles cleaning and feature engineering; Python handles ingestion and
@@ -86,18 +115,16 @@ own published day-ahead forecast, against 48-hour persistence:
 
 ![TSO benchmark](docs/figures/tso_benchmark_by_hour.png)
 
-The operators' forecast is about three times more accurate than persistence
-(0.0131 against 0.0424 mean absolute error, in capacity-factor units, over
-daylight hours). Beating a naive baseline means little here; beating this is the
-actual target.
+The operators' forecast is about three times more accurate than persistence, in
+capacity-factor units over daylight hours. Beating a naive baseline means little
+here; beating this is the actual target.
 
 Why the target is a capacity factor rather than megawatts:
 
 ![Capacity growth](docs/figures/capacity_growth_vs_capacity_factor.png)
 
-Installed capacity grew 87% across the window while the capacity factor stayed
-within a 1.3x band. A model trained on raw MW would learn the deployment trend
-and extrapolate it.
+Installed capacity keeps climbing while the capacity factor does not. A model
+trained on raw MW would learn the deployment trend and extrapolate it.
 
 ## Setup
 
@@ -121,9 +148,13 @@ gcloud auth application-default login
 ## Development
 
 ```bash
-pytest
+pytest -m "not network"    # tests needing BigQuery or a live API skip themselves
 ruff check .
 ```
+
+Tests that need credentials or network are marked and skip when unavailable, so
+a fresh clone is green without any setup. CI runs on 3.11, 3.12 and 3.13, and
+separately checks the committed notebook is executed and error-free.
 
 ## Layout
 
@@ -132,12 +163,14 @@ src/smartgrid/
   config.py        paths, market constants, environment settings
   sources/         one module per data source
   warehouse/       BigQuery load and query helpers
-  modelling/       features, forecasters, walk-forward backtest
-  optimisation/    battery dispatch linear program
+  modelling/       features, forecasters, backtest, live prediction, scoring
+  optimisation/    battery dispatch and the daily recommendation
   viz/             shared chart palette and styling
   ingest.py        fetch every source and load it into BigQuery
-  forecast.py      run the solar backtest
-  dispatch.py      run the battery backtest
+  forecast.py      run the walk-forward solar backtest
+  tomorrow.py      forecast the coming day and recommend a schedule
+  score.py         measure saved forecasts against what happened
+  dispatch.py      run the battery revenue backtest
   dashboard.py     Streamlit app
 transform/         SQLMesh project: staging and mart models, audits
 notebooks/         exploratory analysis
@@ -157,22 +190,30 @@ Run the models and the dashboard:
 
 ```bash
 python -m smartgrid.forecast                   # walk-forward solar backtest
-python -m smartgrid.dispatch                   # battery revenue
+python -m smartgrid.dispatch                   # battery revenue backtest
+python -m smartgrid.tomorrow --save            # forecast and recommend
+python -m smartgrid.score                      # measure saved forecasts
 streamlit run src/smartgrid/dashboard.py       # interactive dashboard
 ```
 
+Running daily is ingest → `sqlmesh plan` → `tomorrow --save`, after 13:00 market
+time so the auction has published. A forecast needs generation history within 48
+hours of the target day, so the ingest is not optional.
+
 ## Roadmap
 
-- [x] 0 — Project skeleton
-- [x] 1 — Google Cloud project and authentication
-- [x] 2 — Ingestion from the three sources
-- [x] 3 — Load into BigQuery
-- [x] 4 — Cleaning and preprocessing in SQLMesh, with audits
-- [x] 5 — Feature engineering
-- [x] 6 — Exploratory analysis
-- [x] 7 — Forecasting: day-ahead solar
-- [x] 8 — Dashboard
-- [x] 9 — Battery dispatch optimiser
+- [x] Ingestion from three sources into BigQuery
+- [x] Cleaning and preprocessing in SQLMesh, with audits
+- [x] Feature engineering with gate-time discipline
+- [x] Exploratory analysis
+- [x] Day-ahead solar forecasting, backtested against the operators' forecast
+- [x] Live prediction for the coming day
+- [x] Battery dispatch optimiser and daily recommendation
+- [x] Dashboard
+- [x] Forecast persistence and live scoring
+- [ ] Household consumption forecasting — OPSD data is ingested but not yet
+      modelled; `plan.py` uses a fixed baseline load in its place
+- [ ] Price forecasting — would close the EUR 85/year gap to perfect foresight
 
 ## Licence
 

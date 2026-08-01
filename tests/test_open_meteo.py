@@ -5,20 +5,28 @@ import pytest
 
 from smartgrid.sources import open_meteo as om
 
-WEATHER_PAYLOAD = {
-    "latitude": 51.16,
-    "longitude": 10.46,
-    "timezone": "GMT",
-    "hourly_units": {"temperature_2m": "°C", "shortwave_radiation": "W/m²"},
-    "hourly": {
+
+def _payload() -> dict:
+    hourly = {
         "time": ["2022-01-01T00:00", "2022-01-01T01:00", "2022-01-01T02:00"],
         "temperature_2m": [11.3, 11.3, 11.1],
         "shortwave_radiation": [0.0, 0.0, 45.5],
         "direct_radiation": [0.0, 0.0, 30.0],
         "diffuse_radiation": [0.0, 0.0, 15.5],
         "cloud_cover": [100, 88, 42],
-    },
-}
+    }
+    # The day-ahead lead is a different forecast, so deliberately different values.
+    hourly |= {
+        "temperature_2m_previous_day1": [10.9, 10.8, 10.5],
+        "shortwave_radiation_previous_day1": [0.0, 0.0, 38.0],
+        "direct_radiation_previous_day1": [0.0, 0.0, 24.0],
+        "diffuse_radiation_previous_day1": [0.0, 0.0, 14.0],
+        "cloud_cover_previous_day1": [100, 95, 55],
+    }
+    return {"latitude": 51.16, "longitude": 10.46, "timezone": "GMT", "hourly": hourly}
+
+
+WEATHER_PAYLOAD = _payload()
 
 
 @pytest.fixture
@@ -35,7 +43,19 @@ def test_columns_are_renamed_to_units_bearing_names(stub_request):
         "direct_radiation_wm2",
         "diffuse_radiation_wm2",
         "cloud_cover_pct",
+        "temperature_c_day_ahead",
+        "ghi_wm2_day_ahead",
+        "direct_radiation_wm2_day_ahead",
+        "diffuse_radiation_wm2_day_ahead",
+        "cloud_cover_pct_day_ahead",
     ]
+
+
+def test_day_ahead_lead_is_a_distinct_forecast(stub_request):
+    """The point of fetching both: they are different values, not aliases."""
+    frame = om.fetch_weather("2022-01-01", "2022-01-02")
+    assert frame["ghi_wm2"].tolist() != frame["ghi_wm2_day_ahead"].tolist()
+    assert frame["ghi_wm2_day_ahead"].iloc[2] == 38.0
 
 
 def test_timestamps_are_utc_aware(stub_request):
@@ -94,3 +114,18 @@ def test_live_request_returns_hourly_data(monkeypatch, tmp_path):
     # Irradiance must be zero at night and positive at midday somewhere in range.
     assert frame["ghi_wm2"].min() == 0
     assert frame["ghi_wm2"].max() > 100
+
+
+@pytest.mark.network
+def test_live_day_ahead_lead_differs_from_short_lead(monkeypatch, tmp_path):
+    """Confirms against the live API that the two leads are genuinely different."""
+    monkeypatch.setattr(om, "CACHE_DIR", tmp_path)
+    frame = om.fetch_weather("2024-06-10", "2024-06-12")
+
+    both = frame.dropna(subset=["ghi_wm2", "ghi_wm2_day_ahead"])
+    assert len(both) > 48
+    assert not both["ghi_wm2"].equals(both["ghi_wm2_day_ahead"])
+
+    daylight = both[both["ghi_wm2"] > 50]
+    disagreement = (daylight["ghi_wm2"] - daylight["ghi_wm2_day_ahead"]).abs().mean()
+    assert disagreement > 10, "a day of lead time should cost real accuracy"

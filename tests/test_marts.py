@@ -19,6 +19,40 @@ PROJECT = get_settings().gcp_project
 MART = f"`{PROJECT}.marts.mart_solar_features`"
 
 
+def test_the_join_does_not_silently_drop_generation_hours():
+    """The guard that matters.
+
+    The mart inner-joins generation against weather. If a source fell behind,
+    training hours would disappear with no error — the table would simply be
+    shorter. Comparing row counts between staging models only catches that
+    indirectly; this checks the join itself.
+
+    One unmatched hour is expected and permanent: Energy-Charts reports from
+    Berlin midnight (23:00 UTC the previous day) while Open-Meteo starts at
+    00:00 UTC, so the first hour of the series has no weather.
+    """
+    unmatched = query(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM `{PROJECT}.staging.stg_generation` AS g
+        LEFT JOIN `{PROJECT}.staging.stg_weather` AS w USING (utc_timestamp)
+        WHERE w.utc_timestamp IS NULL
+        """
+    ).loc[0, "n"]
+
+    assert unmatched <= 2, (
+        f"{unmatched} generation hours have no weather; a source has fallen behind"
+    )
+
+    retained = query(
+        f"""
+        SELECT (SELECT COUNT(*) FROM {MART}) AS mart,
+               (SELECT COUNT(*) FROM `{PROJECT}.staging.stg_generation`) AS generation
+        """
+    ).loc[0]
+    assert retained["mart"] >= retained["generation"] - 2
+
+
 def test_horizons_span_the_day_ahead_window():
     frame = query(
         f"SELECT horizon_hours, COUNT(*) AS n FROM {MART} GROUP BY 1 ORDER BY 1"

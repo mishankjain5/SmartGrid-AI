@@ -25,6 +25,13 @@ LEAD_DAYS = 1
 # reaches further back but cannot be paired with a weather forecast before this.
 DATA_START = date(2022, 1, 1)
 
+# Weather is fetched from later than the rest. Open-Meteo archives day-ahead
+# *radiation* only from 2024-01-19 — temperature at that lead goes back to 2022,
+# radiation does not — so any honest day-ahead solar model starts in 2024
+# regardless. Fetching earlier weather spends API quota on rows the feature table
+# discards, and the free tier meters by data volume.
+WEATHER_START = date(2024, 1, 1)
+
 BIGQUERY_RAW_DATASET = "raw"
 
 

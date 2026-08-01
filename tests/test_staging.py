@@ -20,7 +20,10 @@ pytestmark = pytest.mark.skipif(
 
 PROJECT = get_settings().gcp_project
 
-HOURLY_MODELS = ("stg_price", "stg_weather", "stg_generation", "stg_day_ahead_forecast")
+#: Models sharing the full grid-data window. Weather is excluded deliberately —
+#: it starts in 2024 because Open-Meteo archives day-ahead radiation only from
+#: 2024-01-19, so it is checked separately below.
+HOURLY_MODELS = ("stg_price", "stg_generation", "stg_day_ahead_forecast")
 
 
 @pytest.fixture(scope="module")
@@ -34,23 +37,58 @@ def coverage():
     return query(unions).set_index("model")
 
 
-def test_every_hourly_model_covers_a_comparable_span(coverage):
+def test_grid_models_cover_the_same_span(coverage):
+    """These three come from one API on one grid, so they should agree closely."""
     counts = coverage["n"]
     assert counts.min() > 40_000
 
     # Sources may be refreshed independently, so the newest table can extend a
-    # day or two past the others, and the two APIs disagree about whether date
-    # bounds are local or UTC. Anything beyond that is a truncated load rather
-    # than a boundary difference. Joinability is asserted separately below.
+    # day or two past the others. Anything beyond that is a truncated load.
     assert counts.max() - counts.min() <= 72
 
 
-def test_models_overlap_enough_to_join(coverage):
-    latest_start = coverage["first_ts"].max()
-    earliest_end = coverage["last_ts"].min()
-    span_days = (earliest_end - latest_start).days
+def test_grid_models_overlap_enough_to_join(coverage):
+    span_days = (coverage["last_ts"].min() - coverage["first_ts"].max()).days
+    assert span_days > 1600, "expected roughly four and a half years"
 
-    assert span_days > 1600, "expected roughly four and a half years of overlap"
+
+def test_weather_covers_the_day_ahead_radiation_era():
+    """Weather starts later than the grid data, and that bound is deliberate.
+
+    Open-Meteo archives day-ahead radiation from 2024-01-19. Earlier hours could
+    never yield a usable feature row, so fetching them would spend API quota on
+    data the mart discards.
+    """
+    frame = query(
+        f"""
+        SELECT COUNT(*) AS n,
+               MIN(utc_timestamp) AS first_ts,
+               MAX(utc_timestamp) AS last_ts
+        FROM `{PROJECT}.staging.stg_weather_national`
+        """
+    ).loc[0]
+
+    assert frame["first_ts"].year == 2024
+    span_days = (frame["last_ts"] - frame["first_ts"]).days
+    assert span_days > 900, "at least two and a half years to backtest over"
+    assert frame["n"] > 22_000
+
+
+def test_every_location_reports_for_every_hour():
+    """Nine locations, so a partial fetch would show up as thin hours."""
+    thin = query(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM (
+          SELECT utc_timestamp, COUNT(*) AS locations
+          FROM `{PROJECT}.staging.stg_weather`
+          GROUP BY utc_timestamp
+        )
+        WHERE locations != 9
+        """
+    ).loc[0, "n"]
+
+    assert thin == 0
 
 
 def test_price_is_resampled_to_a_single_resolution():

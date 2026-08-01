@@ -33,17 +33,31 @@ def frame() -> pd.DataFrame:
     ghi = daylight * seasonal * cloud * 900
     target = daylight * seasonal * cloud * 0.45
 
+    # Each location gets its own cloud draw, so the spread features are real.
+    per_location = {
+        name: ghi * rng.uniform(0.7, 1.15, len(index))
+        for name in dataset.LOCATION_FEATURES
+    }
+    location_matrix = np.column_stack(list(per_location.values()))
+
     built = pd.DataFrame(
         {
             "utc_timestamp": index,
             "local_datetime": local.tz_localize(None),
             dataset.TARGET: target,
-            "ghi_wm2_day_ahead": ghi,
-            "direct_radiation_wm2_day_ahead": ghi * 0.7,
-            "diffuse_radiation_wm2_day_ahead": ghi * 0.3,
-            "total_radiation_wm2_day_ahead": ghi,
-            "temperature_c_day_ahead": 10 + 10 * np.sin(day / 365.25 * 2 * np.pi),
-            "cloud_cover_pct_day_ahead": (1 - cloud) * 100,
+        }
+        | per_location
+        | {
+            "ghi_mean": location_matrix.mean(axis=1),
+            "ghi_min": location_matrix.min(axis=1),
+            "ghi_max": location_matrix.max(axis=1),
+            "ghi_stddev": location_matrix.std(axis=1),
+            "ghi_spread": location_matrix.max(axis=1) - location_matrix.min(axis=1),
+            "direct_radiation_mean": ghi * 0.7,
+            "diffuse_radiation_mean": ghi * 0.3,
+            "temperature_mean": 10 + 10 * np.sin(day / 365.25 * 2 * np.pi),
+            "cloud_cover_mean": (1 - cloud) * 100,
+            "cloud_cover_stddev": rng.uniform(0, 20, len(index)),
             "hour_of_day": hour,
             "day_of_week": local.dayofweek.to_numpy(),
             "day_of_year": day,
@@ -77,11 +91,19 @@ def test_the_target_and_benchmark_are_never_features():
         assert column not in dataset.FEATURES
 
 
-def test_only_day_ahead_weather_is_a_feature():
-    """Short-lead weather exists upstream; it must not be selected here."""
-    weather = [f for f in dataset.FEATURES if "radiation" in f or "ghi" in f or "cloud" in f]
-    assert weather
-    assert all(f.endswith("_day_ahead") for f in weather)
+def test_weather_features_cover_the_country_not_one_point():
+    """National output is spread over 800 km; a single point cannot represent it."""
+    assert len(dataset.LOCATION_FEATURES) >= 8
+    assert set(dataset.LOCATION_FEATURES) <= set(dataset.FEATURES)
+
+    # The spread across locations is itself informative and must be carried.
+    assert {"ghi_stddev", "ghi_spread"} <= set(dataset.FEATURES)
+
+
+def test_no_short_lead_weather_is_selected():
+    """stg_weather still holds short-lead columns; none may reach the model."""
+    forbidden = [f for f in dataset.FEATURES if f.endswith(("_wm2", "_pct", "_c"))]
+    assert not forbidden, forbidden
 
 
 def test_no_lag_shorter_than_the_safe_bound():
@@ -97,7 +119,7 @@ def test_modelling_frame_drops_rows_without_features(frame):
 def test_daylight_filter_excludes_night(frame):
     lit = dataset.is_daylight(frame)
     assert lit.any() and not lit.all()
-    assert (frame.loc[~lit, "ghi_wm2_day_ahead"] == 0).all()
+    assert (frame.loc[~lit, "ghi_max"] == 0).all()
 
 
 # --- forecasters ------------------------------------------------------------

@@ -14,7 +14,7 @@ from datetime import date
 
 import pandas as pd
 
-from smartgrid.config import DATA_START, data_end
+from smartgrid.config import DATA_START, WEATHER_START, data_end
 from smartgrid.sources import energy_charts, open_meteo, opsd
 from smartgrid.warehouse.load import load_dataframe
 
@@ -46,7 +46,8 @@ def build_installed_power(start: date, end: date, refresh: bool) -> pd.DataFrame
 
 
 def build_weather(start: date, end: date, refresh: bool) -> pd.DataFrame:
-    return open_meteo.fetch_weather(start, end, refresh=refresh)
+    # Starts later than the other sources; see WEATHER_START.
+    return open_meteo.fetch_weather(max(start, WEATHER_START), end, refresh=refresh)
 
 
 def build_household(start: date, end: date, refresh: bool) -> pd.DataFrame:

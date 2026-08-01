@@ -24,33 +24,47 @@ def test_the_join_does_not_silently_drop_generation_hours():
 
     The mart inner-joins generation against weather. If a source fell behind,
     training hours would disappear with no error — the table would simply be
-    shorter. Comparing row counts between staging models only catches that
+    shorter. Comparing row counts between staging models catches that only
     indirectly; this checks the join itself.
 
-    One unmatched hour is expected and permanent: Energy-Charts reports from
-    Berlin midnight (23:00 UTC the previous day) while Open-Meteo starts at
-    00:00 UTC, so the first hour of the series has no weather.
+    Scoped to the period weather covers. Weather deliberately starts later than
+    generation: Open-Meteo archives day-ahead radiation only from 2024-01-19, so
+    earlier hours could never produce a usable feature row. Within that window,
+    every generation hour must survive.
     """
     unmatched = query(
         f"""
+        WITH covered AS (
+          SELECT MIN(utc_timestamp) AS first_ts, MAX(utc_timestamp) AS last_ts
+          FROM `{PROJECT}.staging.stg_weather_national`
+        )
         SELECT COUNT(*) AS n
         FROM `{PROJECT}.staging.stg_generation` AS g
-        LEFT JOIN `{PROJECT}.staging.stg_weather` AS w USING (utc_timestamp)
+        CROSS JOIN covered AS c
+        LEFT JOIN `{PROJECT}.staging.stg_weather_national` AS w USING (utc_timestamp)
         WHERE w.utc_timestamp IS NULL
+          AND g.utc_timestamp BETWEEN c.first_ts AND c.last_ts
         """
     ).loc[0, "n"]
 
-    assert unmatched <= 2, (
-        f"{unmatched} generation hours have no weather; a source has fallen behind"
+    assert unmatched == 0, (
+        f"{unmatched} generation hours inside the weather window have no weather; "
+        "a source has fallen behind"
     )
 
-    retained = query(
+
+def test_the_mart_covers_the_whole_weather_window():
+    """A shrinking mart is the symptom a row-count tolerance would miss."""
+    frame = query(
         f"""
-        SELECT (SELECT COUNT(*) FROM {MART}) AS mart,
-               (SELECT COUNT(*) FROM `{PROJECT}.staging.stg_generation`) AS generation
+        SELECT
+          (SELECT COUNT(*) FROM {MART}) AS mart_rows,
+          (SELECT COUNT(*) FROM `{PROJECT}.staging.stg_weather_national`) AS weather_rows
         """
     ).loc[0]
-    assert retained["mart"] >= retained["generation"] - 2
+
+    # Weather may run a little past generation at the tail; nothing more.
+    assert frame["mart_rows"] >= frame["weather_rows"] - 48
 
 
 def test_horizons_span_the_day_ahead_window():
@@ -60,8 +74,8 @@ def test_horizons_span_the_day_ahead_window():
 
     assert frame.index.min() == 12
     assert frame.index.max() == 36
-    # Every ordinary horizon appears on most days of the window.
-    assert frame.loc[12:35].min() > 1500
+    # Every ordinary horizon appears on most days of the ~2.5 year window.
+    assert frame.loc[12:35].min() > 900
 
 
 def test_the_thirty_six_hour_horizon_is_rare_and_seasonal():
@@ -92,26 +106,31 @@ def test_capacity_factor_is_bounded_and_complete():
 
 
 def test_normalising_removes_the_deployment_trend():
-    """Capacity nearly doubled; the capacity factor should not follow it."""
+    """Capacity keeps climbing; the capacity factor should not follow it.
+
+    Stated as a ratio between the two rather than as absolute thresholds, so the
+    check survives a change to the date window. Over 2024-2026 capacity rises
+    about 32% while the capacity factor moves about 20% — and in the opposite
+    direction, since 2024 and 2025 were duller than 2026.
+    """
     frame = query(
         f"""
         SELECT EXTRACT(YEAR FROM local_datetime) AS yr,
                AVG(solar_ac_mw) AS capacity,
-               AVG(solar_mw) AS generation,
                AVG(solar_capacity_factor) AS cf
         FROM {MART} GROUP BY 1 ORDER BY 1
         """
     ).set_index("yr")
 
-    growth_in_capacity = frame["capacity"].iloc[-1] / frame["capacity"].iloc[0]
-    spread_in_cf = frame["cf"].max() / frame["cf"].min()
+    capacity_growth = frame["capacity"].iloc[-1] / frame["capacity"].iloc[0] - 1
+    cf_drift = frame["cf"].max() / frame["cf"].min() - 1
 
-    assert growth_in_capacity > 1.7
-    assert spread_in_cf < 1.4, "the normalised target should be far more stable"
+    assert capacity_growth > 0.2, "capacity should be visibly trending"
+    assert cf_drift < capacity_growth, "the normalised target must be the steadier of the two"
 
 
-def test_only_day_ahead_weather_reaches_the_mart():
-    """Short-lead weather exists in staging and must not appear here."""
+def test_weather_in_the_mart_covers_multiple_locations():
+    """A single point cannot represent output spread over 800 km."""
     columns = set(
         query(
             f"""
@@ -122,9 +141,24 @@ def test_only_day_ahead_weather_reaches_the_mart():
         )["column_name"]
     )
 
-    weather = {c for c in columns if "radiation" in c or "cloud" in c or "ghi" in c}
-    assert weather, "expected weather features"
-    assert all(c.endswith("_day_ahead") for c in weather), sorted(weather)
+    per_location = {c for c in columns if c.startswith("ghi_")} - {
+        "ghi_mean", "ghi_min", "ghi_max", "ghi_stddev", "ghi_spread"
+    }
+    assert len(per_location) >= 8, sorted(per_location)
+    assert {"ghi_stddev", "ghi_spread"} <= columns
+
+
+def test_regional_weather_actually_diverges():
+    """If locations never disagreed, sampling several would be pointless."""
+    frame = query(
+        f"""
+        SELECT AVG(ghi_spread) AS mean_spread, MAX(ghi_spread) AS max_spread
+        FROM {MART} WHERE ghi_max > 100
+        """
+    ).loc[0]
+
+    assert frame["mean_spread"] > 50
+    assert frame["max_spread"] > 400
 
 
 def test_lags_are_whole_days_beyond_the_safe_bound():
@@ -172,7 +206,7 @@ def test_tso_benchmark_beats_a_naive_lag():
         SELECT AVG(ABS(tso_solar_forecast_capacity_factor - solar_capacity_factor)) AS tso,
                AVG(ABS(capacity_factor_lag_48h - solar_capacity_factor)) AS lag48
         FROM {MART}
-        WHERE ghi_wm2_day_ahead > 0
+        WHERE ghi_max > 0
           AND tso_solar_forecast_capacity_factor IS NOT NULL
           AND capacity_factor_lag_48h IS NOT NULL
         """

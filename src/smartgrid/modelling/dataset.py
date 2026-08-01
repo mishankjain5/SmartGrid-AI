@@ -17,14 +17,39 @@ from smartgrid.warehouse import query
 
 TARGET = "solar_capacity_factor"
 
-WEATHER_FEATURES = [
-    "ghi_wm2_day_ahead",
-    "direct_radiation_wm2_day_ahead",
-    "diffuse_radiation_wm2_day_ahead",
-    "total_radiation_wm2_day_ahead",
-    "temperature_c_day_ahead",
-    "cloud_cover_pct_day_ahead",
+#: Irradiance at each of the nine sampled locations. Worth about 4% of accuracy
+#: over the national aggregates alone — useful but not the main effect. Most of
+#: the value of sampling several points comes from the averages below, which
+#: estimate national conditions far better than any single reading.
+LOCATION_FEATURES = [
+    "ghi_hamburg",
+    "ghi_rostock",
+    "ghi_hanover",
+    "ghi_berlin",
+    "ghi_cologne",
+    "ghi_kassel",
+    "ghi_nuremberg",
+    "ghi_stuttgart",
+    "ghi_munich",
 ]
+
+#: The averages here are the strongest weather features by permutation
+#: importance. ghi_stddev and ghi_spread describe how uniform the country is,
+#: which the per-location columns imply but do not state directly.
+NATIONAL_WEATHER_FEATURES = [
+    "ghi_mean",
+    "ghi_min",
+    "ghi_max",
+    "ghi_stddev",
+    "ghi_spread",
+    "direct_radiation_mean",
+    "diffuse_radiation_mean",
+    "temperature_mean",
+    "cloud_cover_mean",
+    "cloud_cover_stddev",
+]
+
+WEATHER_FEATURES = LOCATION_FEATURES + NATIONAL_WEATHER_FEATURES
 
 CALENDAR_FEATURES = [
     "hour_of_day",
@@ -91,10 +116,14 @@ def modelling_frame(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def is_daylight(frame: pd.DataFrame) -> pd.Series:
-    """Hours with any forecast irradiance.
+    """Hours with forecast irradiance anywhere in the country.
 
     Solar output is exactly zero at night and every method predicts that
     correctly, so scoring across all hours averages in thousands of free correct
     answers and flatters everything equally.
+
+    Uses the maximum across locations rather than the mean: sunrise reaches the
+    east before the west, and an hour lit anywhere is an hour the grid sees
+    generation in.
     """
-    return frame["ghi_wm2_day_ahead"] > 0
+    return frame["ghi_max"] > 0

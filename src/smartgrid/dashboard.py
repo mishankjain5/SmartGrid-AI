@@ -17,6 +17,7 @@ import streamlit as st
 from smartgrid.config import MARKET_TIMEZONE, get_settings
 from smartgrid.modelling import default_models, load_features, modelling_frame
 from smartgrid.modelling.backtest import run_backtest
+from smartgrid.modelling.household import fit_profile
 from smartgrid.modelling.predict import predict_day, prices_expected, target_day
 from smartgrid.optimisation import Battery, plan_day
 from smartgrid.tomorrow import load_published_prices
@@ -35,6 +36,16 @@ def cached_forecast(day_iso: str) -> pd.DataFrame:
 @st.cache_data(ttl=FORECAST_TTL, show_spinner=False)
 def cached_prices() -> pd.Series:
     return load_published_prices()
+
+
+@st.cache_resource(ttl=HISTORY_TTL, show_spinner=False)
+def cached_profile():
+    """The measured household load profile.
+
+    cache_resource rather than cache_data: this returns an object, not a frame,
+    and it is read-only once fitted.
+    """
+    return fit_profile()
 
 
 @st.cache_data(ttl=HISTORY_TTL, show_spinner=False)
@@ -89,15 +100,26 @@ def tomorrow_view(battery: Battery, system_kwp: float) -> None:
         _solar_chart(prediction, system_kwp)
         return
 
-    plan = plan_day(prediction, prices, battery=battery, system_kwp=system_kwp)
+    profile = cached_profile()
+    plan = plan_day(
+        prediction,
+        prices,
+        battery=battery,
+        system_kwp=system_kwp,
+        load_kwh=profile.for_day(day),
+    )
 
     left, middle, right = st.columns(3)
     left.metric("Predicted generation", f"{generation_kwh:.1f} kWh")
     middle.metric("Expected benefit", f"EUR {plan.total_benefit_eur:.2f}")
     right.metric(
-        "Price range",
-        f"{plan.hours['price_eur_mwh'].min():.0f}-"
-        f"{plan.hours['price_eur_mwh'].max():.0f} EUR/MWh",
+        "Expected consumption", f"{plan.hours['expected_load_kw'].sum():.1f} kWh"
+    )
+    st.caption(
+        f"Consumption from a profile fitted to {profile.building}, "
+        f"{profile.hours_observed:,} metered hours. Prices range "
+        f"{plan.hours['price_eur_mwh'].min():.0f} to "
+        f"{plan.hours['price_eur_mwh'].max():.0f} EUR/MWh."
     )
 
     st.markdown("**What to do**")
@@ -135,9 +157,14 @@ def _plan_chart(plan) -> None:
 
     axes[0].fill_between(local, hours["predicted_solar_kw"], color=style.BLUE,
                          alpha=0.25, linewidth=0)
-    axes[0].plot(local, hours["predicted_solar_kw"], color=style.BLUE)
-    axes[0].set_ylabel("solar kW")
-    style.titled(axes[0], "Predicted generation")
+    axes[0].plot(local, hours["predicted_solar_kw"], color=style.BLUE,
+                 label="predicted solar")
+    axes[0].plot(local, hours["expected_load_kw"], color=style.ORANGE,
+                 linewidth=1.4, label="expected load")
+    axes[0].set_ylabel("kW")
+    axes[0].legend(loc="upper left")
+    style.titled(axes[0], "Generation against household demand",
+                 "Where solar sits above load, the surplus is exported or stored")
 
     axes[1].plot(local, hours["price_eur_mwh"], color=style.ORANGE)
     axes[1].axhline(0, color=style.AXIS, linewidth=0.8)

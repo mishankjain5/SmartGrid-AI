@@ -1,35 +1,49 @@
-"""Streamlit dashboard over the BigQuery marts.
+"""Streamlit dashboard.
 
     streamlit run src/smartgrid/dashboard.py
 
-Three views: what the grid did, how the solar forecast performs against the
-transmission operators' own forecast, and what a battery would earn trading
-against day-ahead prices.
+Leads with tomorrow: the solar forecast, the battery schedule it implies, and
+what that is worth. Accuracy and market context sit behind it, because they
+justify the forecast rather than being the point of it.
 
-Queries are cached, so moving the date range does not re-bill BigQuery for data
-already fetched.
+Every expensive step is cached. Training the model and solving 24 hours of
+dispatch takes seconds; the historical backtest takes a minute or two.
 """
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
-from smartgrid.config import get_settings
-from smartgrid.optimisation import Battery, annualise, optimise_series
+from smartgrid.config import MARKET_TIMEZONE, get_settings
+from smartgrid.modelling import default_models, load_features, modelling_frame
+from smartgrid.modelling.backtest import run_backtest
+from smartgrid.modelling.predict import predict_day, prices_expected, target_day
+from smartgrid.optimisation import Battery, plan_day
+from smartgrid.tomorrow import load_published_prices
 from smartgrid.viz import style
 from smartgrid.warehouse import query
 
-CACHE_SECONDS = 3600
+FORECAST_TTL = 1800
+HISTORY_TTL = 3600
 
 
-@st.cache_data(ttl=CACHE_SECONDS)
-def load_solar() -> pd.DataFrame:
+@st.cache_data(ttl=FORECAST_TTL, show_spinner=False)
+def cached_forecast(day_iso: str) -> pd.DataFrame:
+    return predict_day(day=pd.Timestamp(day_iso).tz_localize(MARKET_TIMEZONE))
+
+
+@st.cache_data(ttl=FORECAST_TTL, show_spinner=False)
+def cached_prices() -> pd.Series:
+    return load_published_prices()
+
+
+@st.cache_data(ttl=HISTORY_TTL, show_spinner=False)
+def cached_history() -> pd.DataFrame:
     project = get_settings().require_project()
     frame = query(
         f"""
-        SELECT utc_timestamp, local_datetime, hour_of_day,
-               solar_capacity_factor, solar_mw, solar_ac_mw,
-               tso_solar_forecast_capacity_factor, ghi_mean, ghi_max, ghi_spread
+        SELECT utc_timestamp, local_datetime, hour_of_day, month_of_year,
+               solar_capacity_factor, tso_solar_forecast_capacity_factor, ghi_max
         FROM `{project}.marts.mart_solar_features`
         ORDER BY utc_timestamp
         """
@@ -38,139 +52,176 @@ def load_solar() -> pd.DataFrame:
     return frame
 
 
-@st.cache_data(ttl=CACHE_SECONDS)
-def load_prices() -> pd.Series:
-    project = get_settings().require_project()
-    frame = query(
-        f"""
-        SELECT utc_timestamp, price_eur_mwh
-        FROM `{project}.staging.stg_price`
-        WHERE price_eur_mwh IS NOT NULL
-        ORDER BY utc_timestamp
-        """
+@st.cache_data(ttl=HISTORY_TTL, show_spinner=False)
+def cached_backtest() -> pd.DataFrame:
+    frame = modelling_frame(load_features())
+    result = run_backtest(frame, default_models(), test_days=60, verbose=False)
+    return result.summary()
+
+
+# --- tomorrow ---------------------------------------------------------------
+
+
+def tomorrow_view(battery: Battery, system_kwp: float) -> None:
+    day = target_day()
+    st.subheader(f"Forecast for {day.strftime('%A %d %B %Y')}")
+
+    with st.spinner("Training on all history and forecasting..."):
+        prediction = cached_forecast(str(day.date()))
+        prices = cached_prices()
+
+    generation_kwh = float(
+        (prediction["predicted_capacity_factor"] * system_kwp).sum()
     )
-    return frame.set_index("utc_timestamp")["price_eur_mwh"]
+    covered = prices.loc[prices.index >= day.tz_convert("UTC")]
 
+    if len(covered) < 24:
+        st.warning(
+            f"Only {len(covered)} of 24 hours are priced for {day.date()}. "
+            + (
+                "The auction has cleared but the feed has not caught up yet."
+                if prices_expected()
+                else "The day-ahead auction clears at 12:00 and publishes around "
+                "12:45 market time."
+            )
+        )
+        st.metric("Predicted generation", f"{generation_kwh:.1f} kWh")
+        _solar_chart(prediction, system_kwp)
+        return
 
-@st.cache_data(ttl=CACHE_SECONDS)
-def dispatch(energy_kwh: float, power_kw: float, round_trip: float) -> dict:
-    battery = Battery(
-        energy_mwh=energy_kwh / 1000,
-        power_mw=power_kw / 1000,
-        round_trip_efficiency=round_trip,
-    )
-    prices = load_prices()
-
-    perfect = annualise(optimise_series(prices, battery), battery)
-    naive = annualise(
-        optimise_series(prices, battery, decision_prices=prices.shift(24)), battery
-    )
-    return {"perfect": perfect, "naive": naive}
-
-
-def solar_view(solar: pd.DataFrame) -> None:
-    st.subheader("Solar forecast against the operators' own")
-
-    daylight = solar[
-        (solar["ghi_max"] > 0) & solar["tso_solar_forecast_capacity_factor"].notna()
-    ].copy()
-    daylight["tso_error"] = (
-        daylight["tso_solar_forecast_capacity_factor"] - daylight["solar_capacity_factor"]
-    ).abs()
+    plan = plan_day(prediction, prices, battery=battery, system_kwp=system_kwp)
 
     left, middle, right = st.columns(3)
-    left.metric("Daylight hours", f"{len(daylight):,}")
-    middle.metric("TSO forecast MAE", f"{daylight['tso_error'].mean():.4f}")
+    left.metric("Predicted generation", f"{generation_kwh:.1f} kWh")
+    middle.metric("Expected benefit", f"EUR {plan.total_benefit_eur:.2f}")
     right.metric(
-        "Peak capacity factor", f"{solar['solar_capacity_factor'].max():.2f}"
-    )
-    st.caption(
-        "Capacity-factor units. Night is excluded: output is exactly zero then and "
-        "every method predicts it correctly, which flatters all of them equally."
+        "Price range",
+        f"{plan.hours['price_eur_mwh'].min():.0f}-"
+        f"{plan.hours['price_eur_mwh'].max():.0f} EUR/MWh",
     )
 
-    recent = solar[solar["local_datetime"] >= solar["local_datetime"].max() - pd.Timedelta(14, "D")]
+    st.markdown("**What to do**")
+    for line in plan.advice():
+        st.markdown(f"- {line}")
 
-    fig, ax = plt.subplots(figsize=(10, 3.6))
-    ax.plot(recent["local_datetime"], recent["solar_capacity_factor"],
-            color=style.BLUE, label="actual")
-    ax.plot(recent["local_datetime"], recent["tso_solar_forecast_capacity_factor"],
-            color=style.ORANGE, linewidth=1.2, label="TSO forecast")
-    ax.set_ylabel("capacity factor")
-    ax.legend(loc="upper left")
-    style.titled(ax, "Last two weeks")
-    st.pyplot(fig)
+    _plan_chart(plan)
 
-    by_hour = daylight.groupby("hour_of_day")["tso_error"].mean()
+    with st.expander("Hour by hour"):
+        table = plan.hours.reset_index(drop=True)
+        st.dataframe(table.round(2), width="stretch")
+
+
+def _solar_chart(prediction: pd.DataFrame, system_kwp: float) -> None:
+    local = pd.to_datetime(prediction["local_datetime"])
     fig, ax = plt.subplots(figsize=(10, 3.2))
-    ax.plot(by_hour.index, by_hour.to_numpy(), color=style.BLUE, marker="o")
-    ax.set_xlabel("hour of day (Europe/Berlin)")
-    ax.set_ylabel("mean absolute error")
-    ax.set_xticks(range(0, 24, 3))
-    style.titled(ax, "Forecast error is hardest around midday")
+    ax.fill_between(
+        local,
+        prediction["predicted_capacity_factor"] * system_kwp,
+        color=style.BLUE,
+        alpha=0.25,
+        linewidth=0,
+    )
+    ax.plot(local, prediction["predicted_capacity_factor"] * system_kwp, color=style.BLUE)
+    ax.set_ylabel("kW")
+    style.titled(ax, "Predicted output")
     st.pyplot(fig)
 
 
-def price_view(prices: pd.Series) -> None:
-    st.subheader("Day-ahead prices")
+def _plan_chart(plan) -> None:
+    hours = plan.hours
+    local = hours.index.tz_convert(MARKET_TIMEZONE)
 
-    negative = (prices < 0).mean()
-    local_hour = prices.index.tz_convert("Europe/Berlin").hour
+    fig, axes = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
+
+    axes[0].fill_between(local, hours["predicted_solar_kw"], color=style.BLUE,
+                         alpha=0.25, linewidth=0)
+    axes[0].plot(local, hours["predicted_solar_kw"], color=style.BLUE)
+    axes[0].set_ylabel("solar kW")
+    style.titled(axes[0], "Predicted generation")
+
+    axes[1].plot(local, hours["price_eur_mwh"], color=style.ORANGE)
+    axes[1].axhline(0, color=style.AXIS, linewidth=0.8)
+    axes[1].set_ylabel("EUR/MWh")
+    style.titled(axes[1], "Published day-ahead price")
+
+    axes[2].bar(local, hours["charge_kw"], width=0.03, color=style.GREEN, label="charge")
+    axes[2].bar(local, -hours["discharge_kw"], width=0.03, color=style.CRITICAL,
+                label="discharge")
+    axes[2].axhline(0, color=style.AXIS, linewidth=0.8)
+    axes[2].set_ylabel("kW")
+    axes[2].legend(loc="upper left")
+    style.titled(axes[2], "Recommended battery schedule")
+
+    st.pyplot(fig)
+
+
+# --- accuracy ---------------------------------------------------------------
+
+
+def accuracy_view() -> None:
+    st.subheader("Does the forecast work?")
+    st.caption(
+        "Walk-forward backtest: train on history up to a point, forecast the next "
+        "window, step forward, refit. Scored on daylight hours against the "
+        "forecast the transmission operators actually published."
+    )
+
+    with st.spinner("Replaying history..."):
+        summary = cached_backtest()
+
+    best = summary.index[0]
+    ours = summary.loc["gradient_boosting"]
+    tso = summary.loc["TSO forecast"]
+
+    left, middle, right = st.columns(3)
+    left.metric("Our model, MAE", f"{ours['mae']:.4f}")
+    middle.metric("Operators' forecast, MAE", f"{tso['mae']:.4f}")
+    right.metric("Ratio", f"{ours['mae'] / tso['mae']:.1f}x")
+
+    st.dataframe(summary.round(4), width="stretch")
+    st.caption(
+        f"Lowest error: {best}. Capacity-factor units. The operators have "
+        "plant-level registry data, live telemetry and multi-model ensembles; "
+        "this uses free public data only."
+    )
+
+
+# --- market -----------------------------------------------------------------
+
+
+def market_view(history: pd.DataFrame) -> None:
+    st.subheader("Market context")
+
+    pivot = history.pivot_table(
+        index="month_of_year", columns="hour_of_day",
+        values="solar_capacity_factor", aggfunc="mean",
+    )
+
+    fig, ax = plt.subplots(figsize=(10, 3.8))
+    mesh = ax.pcolormesh(pivot.columns, pivot.index, pivot.to_numpy(),
+                         cmap=style.sequential_cmap(), shading="nearest")
+    ax.set_xlabel("hour of day (Europe/Berlin)")
+    ax.set_yticks(range(1, 13))
+    ax.invert_yaxis()
+    ax.grid(False)
+    style.titled(ax, "Solar output by month and hour", "Mean capacity factor")
+    bar = fig.colorbar(mesh, ax=ax, pad=0.02)
+    bar.outline.set_visible(False)
+    bar.ax.tick_params(length=0, labelsize=9)
+    st.pyplot(fig)
+
+    prices = cached_prices()
+    local_hour = prices.index.tz_convert(MARKET_TIMEZONE).hour
     shape = prices.groupby(local_hour).mean()
 
-    left, middle, right = st.columns(3)
-    left.metric("Hours priced", f"{len(prices):,}")
-    middle.metric("Negative hours", f"{negative:.1%}")
-    right.metric("Daily spread", f"{shape.max() - shape.min():.0f} EUR/MWh")
-
-    fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
-    axes[0].hist(prices, bins=120, color=style.BLUE)
-    axes[0].axvline(0, color=style.CRITICAL, linewidth=1)
-    axes[0].set_xlim(-100, 400)
-    axes[0].set_xlabel("EUR/MWh")
-    style.titled(axes[0], "Distribution")
-
-    axes[1].plot(shape.index, shape.to_numpy(), color=style.BLUE, marker="o")
-    axes[1].set_xlabel("hour of day")
-    axes[1].set_xticks(range(0, 24, 3))
-    style.titled(axes[1], "Daily shape")
+    fig, ax = plt.subplots(figsize=(10, 3.2))
+    ax.plot(shape.index, shape.to_numpy(), color=style.BLUE, marker="o")
+    ax.set_xlabel("hour of day")
+    ax.set_xticks(range(0, 24, 3))
+    ax.set_ylabel("EUR/MWh")
+    style.titled(ax, "Recent price shape",
+                 "Midday dip from solar, evening peak — the spread a battery trades")
     st.pyplot(fig)
-
-    st.caption(
-        "The midday dip is solar pushing prices down; the two peaks are why a "
-        "battery can cycle twice a day."
-    )
-
-
-def battery_view() -> None:
-    st.subheader("Battery dispatch")
-
-    left, middle, right = st.columns(3)
-    energy_kwh = left.slider("Capacity (kWh)", 5.0, 50.0, 10.0, step=5.0)
-    power_kw = middle.slider("Power (kW)", 2.5, 25.0, 5.0, step=2.5)
-    round_trip = right.slider("Round-trip efficiency", 0.70, 1.00, 0.90, step=0.05)
-
-    with st.spinner("Solving dispatch..."):
-        result = dispatch(energy_kwh, power_kw, round_trip)
-
-    perfect, naive = result["perfect"], result["naive"]
-    capture = naive["annual_eur"] / perfect["annual_eur"]
-
-    left, middle, right = st.columns(3)
-    left.metric("Perfect foresight", f"EUR {perfect['annual_eur']:.0f}/yr")
-    middle.metric(
-        "Previous-day prices",
-        f"EUR {naive['annual_eur']:.0f}/yr",
-        delta=f"{capture - 1:.0%} vs perfect",
-    )
-    right.metric("Cycles per year", f"{naive['cycles_per_year']:.0f}")
-
-    st.caption(
-        f"Perfect foresight is an upper bound, not an achievable result. The gap "
-        f"of EUR {perfect['annual_eur'] - naive['annual_eur']:.0f}/year is what a "
-        f"price forecast would be worth. Degradation is not modelled, so check the "
-        f"cycle count against a warranty before believing the revenue."
-    )
 
 
 def main() -> None:
@@ -179,22 +230,40 @@ def main() -> None:
 
     st.title("SmartGrid-AI")
     st.caption(
-        "German day-ahead solar forecasting and battery dispatch, built on "
-        "Energy-Charts, Open-Meteo and BigQuery."
+        "Day-ahead solar forecasting and battery dispatch for German households."
     )
 
     if not get_settings().bigquery_available:
         st.error("GCP_PROJECT is not set. Copy .env.example to .env and fill it in.")
         return
 
-    solar_tab, price_tab, battery_tab = st.tabs(["Solar", "Prices", "Battery"])
+    with st.sidebar:
+        st.header("System")
+        system_kwp = st.slider("PV array (kWp)", 2.0, 30.0, 10.0, step=1.0)
+        energy_kwh = st.slider("Battery capacity (kWh)", 5.0, 50.0, 10.0, step=5.0)
+        power_kw = st.slider("Battery power (kW)", 2.5, 25.0, 5.0, step=2.5)
+        round_trip = st.slider("Round-trip efficiency", 0.70, 1.00, 0.90, step=0.05)
+        st.caption(
+            "The national capacity factor is applied to your array, which assumes "
+            "it behaves like the German fleet on average."
+        )
 
-    with solar_tab:
-        solar_view(load_solar())
-    with price_tab:
-        price_view(load_prices())
-    with battery_tab:
-        battery_view()
+    battery = Battery(
+        energy_mwh=energy_kwh / 1000,
+        power_mw=power_kw / 1000,
+        round_trip_efficiency=round_trip,
+    )
+
+    tomorrow_tab, accuracy_tab, market_tab = st.tabs(
+        ["Tomorrow", "Accuracy", "Market"]
+    )
+
+    with tomorrow_tab:
+        tomorrow_view(battery, system_kwp)
+    with accuracy_tab:
+        accuracy_view()
+    with market_tab:
+        market_view(cached_history())
 
 
 main()

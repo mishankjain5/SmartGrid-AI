@@ -9,16 +9,21 @@ once at noon the day before, so a day is the natural planning horizon. Each day
 starts and ends at the same state of charge, which stops the optimiser from
 manufacturing revenue by simply draining the battery and never refilling it.
 
-Formulated as a linear program rather than a heuristic because the optimum is
+Formulated as an optimisation rather than a heuristic because the optimum is
 exactly computable here, and a rule of thumb ("charge in the cheapest four
 hours") would leave money on the table without making it obvious how much.
+
+Mixed-integer rather than purely linear: one binary per hour records which way
+the inverter is running. A pure LP charges and discharges simultaneously
+whenever prices go negative, which is profitable on paper and impossible in
+practice.
 """
 
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import linprog
+from scipy.optimize import Bounds, LinearConstraint, milp
 
 HOURS_PER_DAY = 24
 
@@ -78,38 +83,79 @@ def optimise_day(prices_eur_mwh: np.ndarray, battery: Battery) -> Schedule:
 
     n = len(prices)
     efficiency = battery.leg_efficiency
+    power, capacity = battery.power_mw, battery.energy_mwh
+
+    # Variables: charge, discharge, state of charge, and a binary per hour saying
+    # which direction the inverter is running.
+    width = 4 * n
+    charge_at = lambda t: t  # noqa: E731
+    discharge_at = lambda t: n + t  # noqa: E731
+    soc_at = lambda t: 2 * n + t  # noqa: E731
+    mode_at = lambda t: 3 * n + t  # noqa: E731
 
     # Maximise revenue, so minimise its negative. Discharging earns the price,
-    # charging pays it.
-    objective = np.concatenate([prices, -prices, np.zeros(n)])
+    # charging pays it. The binaries carry no cost.
+    objective = np.concatenate([prices, -prices, np.zeros(2 * n)])
+
+    rows, lower, upper = [], [], []
 
     # Energy balance: soc[t] - soc[t-1] - eff * charge[t] + discharge[t] / eff = 0
-    balance = np.zeros((n, 3 * n))
-    target = np.zeros(n)
+    initial = capacity / 2
     for t in range(n):
-        balance[t, t] = -efficiency
-        balance[t, n + t] = 1.0 / efficiency
-        balance[t, 2 * n + t] = 1.0
+        row = np.zeros(width)
+        row[charge_at(t)] = -efficiency
+        row[discharge_at(t)] = 1.0 / efficiency
+        row[soc_at(t)] = 1.0
         if t > 0:
-            balance[t, 2 * n + t - 1] = -1.0
+            row[soc_at(t - 1)] = -1.0
+        rows.append(row)
+        bound = initial if t == 0 else 0.0
+        lower.append(bound)
+        upper.append(bound)
 
-    # Start and end the day half full, so revenue cannot come from net depletion.
-    initial = battery.energy_mwh / 2
-    target[0] = initial
+    # Finish where the day started, so revenue cannot come from net depletion.
+    closing = np.zeros(width)
+    closing[soc_at(n - 1)] = 1.0
+    rows.append(closing)
+    lower.append(initial)
+    upper.append(initial)
 
-    closing = np.zeros((1, 3 * n))
-    closing[0, 3 * n - 1] = 1.0
+    # One inverter, one direction at a time. Without this the solver charges and
+    # discharges in the same hour whenever prices are negative: being paid to
+    # consume makes it profitable to circulate energy and burn it as round-trip
+    # losses. Economically rational, physically impossible, and it would destroy
+    # the battery. Bounding only the sum is not enough — the solver simply splits
+    # the inverter's rating between the two directions.
+    for t in range(n):
+        charging = np.zeros(width)
+        charging[charge_at(t)] = 1.0
+        charging[mode_at(t)] = -power
+        rows.append(charging)
+        lower.append(-np.inf)
+        upper.append(0.0)
 
-    result = linprog(
+        discharging = np.zeros(width)
+        discharging[discharge_at(t)] = 1.0
+        discharging[mode_at(t)] = power
+        rows.append(discharging)
+        lower.append(-np.inf)
+        upper.append(power)
+
+    result = milp(
         c=objective,
-        A_eq=np.vstack([balance, closing]),
-        b_eq=np.concatenate([target, [initial]]),
-        bounds=(
-            [(0, battery.power_mw)] * n
-            + [(0, battery.power_mw)] * n
-            + [(0, battery.energy_mwh)] * n
+        constraints=LinearConstraint(np.vstack(rows), lower, upper),
+        integrality=np.concatenate([np.zeros(3 * n), np.ones(n)]),
+        bounds=Bounds(
+            lb=np.zeros(width),
+            ub=np.concatenate(
+                [
+                    np.full(n, power),
+                    np.full(n, power),
+                    np.full(n, capacity),
+                    np.ones(n),
+                ]
+            ),
         ),
-        method="highs",
     )
 
     if not result.success:
@@ -121,7 +167,8 @@ def optimise_day(prices_eur_mwh: np.ndarray, battery: Battery) -> Schedule:
     return Schedule(
         charge_mw=charge,
         discharge_mw=discharge,
-        state_of_charge_mwh=result.x[2 * n :],
+        # Bounded slice: the tail of the solution holds the mode binaries.
+        state_of_charge_mwh=result.x[2 * n : 3 * n],
         revenue_eur=float(np.dot(prices, discharge - charge)),
     )
 

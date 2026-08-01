@@ -81,6 +81,36 @@ def test_negative_prices_are_exploited(battery):
     assert schedule.revenue_eur > 0
 
 
+@pytest.mark.parametrize(
+    "prices",
+    [
+        np.array([-50.0] * 6 + [30.0] * 18),
+        np.array([-5.0] * 24),
+        np.concatenate([np.full(12, -3.0), np.full(12, 180.0)]),
+    ],
+    ids=["negative_then_positive", "all_negative", "negative_then_peak"],
+)
+def test_it_never_charges_and_discharges_at_once(battery, prices):
+    """A real inverter cannot do both, and negative prices tempt the solver to try.
+
+    Being paid to consume makes circulating energy through the battery profitable
+    on paper: the round-trip losses are the "consumption" being paid for. The
+    shared inverter limit forbids it.
+    """
+    schedule = optimise_day(prices, battery)
+    both = (schedule.charge_mw > 1e-9) & (schedule.discharge_mw > 1e-9)
+
+    assert not both.any(), f"simultaneous operation in hours {np.flatnonzero(both)}"
+
+
+def test_combined_throughput_respects_the_inverter(battery):
+    prices = np.concatenate([np.full(12, -3.0), np.full(12, 180.0)])
+    schedule = optimise_day(prices, battery)
+
+    combined = schedule.charge_mw + schedule.discharge_mw
+    assert combined.max() <= battery.power_mw + 1e-9
+
+
 def test_nan_prices_are_refused(battery):
     prices = CHEAP_THEN_DEAR.copy()
     prices[5] = np.nan
